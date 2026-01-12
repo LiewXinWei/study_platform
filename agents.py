@@ -1,4 +1,5 @@
 import os
+import re
 from typing import Literal
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
@@ -16,6 +17,66 @@ def get_llm():
         temperature=0.7,
         api_key=os.getenv("OPENAI_API_KEY")
     )
+
+
+# Verbosity detection keywords
+VERBOSE_KEYWORDS = [
+    "detail", "detailed", "deep", "deeper", "expand", "explain more",
+    "step by step", "step-by-step", "elaborate", "in depth", "in-depth",
+    "comprehensive", "thorough", "full explanation", "more info", "more information"
+]
+
+
+def detect_verbosity(message: str) -> bool:
+    """Check if user is requesting detailed/verbose response."""
+    message_lower = message.lower()
+    return any(keyword in message_lower for keyword in VERBOSE_KEYWORDS)
+
+
+def detect_code_request(message: str) -> bool:
+    """Check if user explicitly asks for code."""
+    code_keywords = [
+        "show code", "code example", "example code", "implementation",
+        "snippet", "write code", "give me code", "show me code",
+        "how to code", "code it", "sample code", "code sample"
+    ]
+    message_lower = message.lower()
+    return any(keyword in message_lower for keyword in code_keywords)
+
+
+# Base concise response rules (prepended to all prompts)
+CONCISE_RULES = """
+RESPONSE STYLE RULES (ALWAYS FOLLOW):
+- Keep responses SHORT by default: max 2-3 sentences OR max 3 bullet points
+- Use plain English first, avoid jargon unless necessary
+- NO code blocks unless the user explicitly asks for code (e.g., "show code", "example", "implementation", "snippet")
+- If user asks for more detail (e.g., "explain more", "go deeper", "step by step"), then expand
+- Focus on the key insight, not exhaustive coverage
+
+"""
+
+# Character limit for auto-rewrite
+MAX_RESPONSE_LENGTH = 1200
+
+
+def rewrite_to_concise(response: str, llm) -> str:
+    """Rewrite a long response to a concise version using LLM."""
+    rewrite_prompt = """Rewrite the following response into a CONCISE version:
+- Max 3 bullet points
+- Keep the same meaning
+- Plain English, no jargon
+- Remove any code blocks
+- Focus on the key takeaway
+
+Original response:
+{response}
+
+Concise version:"""
+
+    result = llm.invoke([
+        SystemMessage(content=rewrite_prompt.format(response=response))
+    ])
+    return result.content
 
 
 # Subject-specific system prompts
@@ -132,12 +193,29 @@ def assistant_node(state: StudyState) -> dict:
     """
     Main assistant node that responds based on the detected subject.
     Uses tools for notes, solutions, and web search.
+    Applies concise response rules by default.
     """
     llm = get_llm()
     subject = state.get("current_subject", Subject.GENERAL)
+    user_message = state.get("user_message", "")
 
-    # Get the appropriate system prompt
-    system_prompt = SUBJECT_PROMPTS.get(subject, SUBJECT_PROMPTS[Subject.GENERAL])
+    # Detect if user wants verbose/detailed response
+    verbose_mode = detect_verbosity(user_message)
+    code_requested = detect_code_request(user_message)
+
+    # Build system prompt with concise rules first
+    system_prompt = CONCISE_RULES
+
+    # Add verbose mode override if detected
+    if verbose_mode:
+        system_prompt += "\n[VERBOSE MODE]: User requested detailed explanation. You may provide longer, more comprehensive responses.\n"
+
+    # Add code permission if detected
+    if code_requested:
+        system_prompt += "\n[CODE REQUESTED]: User explicitly asked for code. You may include code examples.\n"
+
+    # Add subject-specific prompt
+    system_prompt += SUBJECT_PROMPTS.get(subject, SUBJECT_PROMPTS[Subject.GENERAL])
 
     # Add tool usage instructions
     system_prompt += """
@@ -168,7 +246,8 @@ Always be helpful and provide clear, actionable responses. The current subject i
     # Get response
     response = llm_with_tools.invoke(messages)
 
-    return {"messages": [response]}
+    # Store verbose_mode flag for post-processing
+    return {"messages": [response], "verbose_mode": verbose_mode}
 
 
 def tool_node(state: StudyState) -> dict:

@@ -3,7 +3,10 @@ from langgraph.prebuilt import ToolNode
 from langchain_core.messages import HumanMessage
 
 from state import StudyState
-from agents import router_node, assistant_node, should_continue
+from agents import (
+    router_node, assistant_node, should_continue,
+    rewrite_to_concise, get_llm, MAX_RESPONSE_LENGTH
+)
 from tools import all_tools
 
 
@@ -74,7 +77,8 @@ def chat(message: str, session_id: str = "default") -> dict:
         "current_subject": None,
         "session_id": session_id,
         "user_message": message,
-        "needs_web_search": False
+        "needs_web_search": False,
+        "verbose_mode": False
     }
 
     # Run the graph
@@ -83,6 +87,12 @@ def chat(message: str, session_id: str = "default") -> dict:
     # Extract the final response
     final_message = result["messages"][-1]
     response_content = final_message.content if hasattr(final_message, "content") else str(final_message)
+
+    # Post-processing: auto-rewrite long responses if not in verbose mode
+    verbose_mode = result.get("verbose_mode", False)
+    if not verbose_mode and len(response_content) > MAX_RESPONSE_LENGTH:
+        llm = get_llm()
+        response_content = rewrite_to_concise(response_content, llm)
 
     return {
         "response": response_content,

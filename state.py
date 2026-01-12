@@ -22,3 +22,6 @@ class StudyState(TypedDict):
 
     # Flag to indicate if we should use web search
     needs_web_search: bool
+
+    # Flag to indicate verbose mode (user requested detail)
+    verbose_mode: bool
