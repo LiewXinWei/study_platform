@@ -1,12 +1,23 @@
 import os
 import re
-from typing import Literal
+import json
+from typing import Literal, Optional
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 
 from models import Subject
 from state import StudyState
 from tools import all_tools
+
+
+# JSON Router Schema for structured routing decisions
+ROUTER_JSON_SCHEMA = {
+    "mode": "ANSWER|TEACH|QUIZ|DEBUG|ASK_CLARIFY|SIMPLIFY",
+    "topic": "LangGraph|Python|LangChain|JavaScript|LLM|Automation|n8n|GoHighLevel|Unknown",
+    "confidence": "number 0-1",
+    "missing_info": "list of strings",
+    "reason": "short explanation"
+}
 
 
 # Initialize the LLM
@@ -35,10 +46,75 @@ SIMPLIFY_KEYWORDS = [
     "eli5", "in order", "in order way", "tell me in order",
     "break it down", "break down", "use simple words", "simpler words",
     "too technical", "too complicated", "too complex", "what does that mean",
-    "what do you mean", "explain that", "can you simplify", "simplify",
+    "what do you mean", "what do u mean", "explain that", "can you simplify", "simplify",
     "dumb it down", "layman terms", "layman's terms", "plain english",
-    "beginner friendly", "for beginners", "simple explanation"
+    "beginner friendly", "for beginners", "simple explanation",
+    "what do u mean by that", "what does that mean by that", "huh", "what"
 ]
+
+
+def parse_router_json(response_text: str) -> Optional[dict]:
+    """
+    Parse JSON from router response. Handles markdown code blocks and raw JSON.
+    Returns None if parsing fails (triggers fallback to ASK_CLARIFY).
+    """
+    # Try to extract JSON from markdown code block
+    json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', response_text, re.DOTALL)
+    if json_match:
+        try:
+            return json.loads(json_match.group(1))
+        except json.JSONDecodeError:
+            pass
+
+    # Try raw JSON
+    try:
+        # Find JSON object in response
+        start = response_text.find('{')
+        end = response_text.rfind('}') + 1
+        if start != -1 and end > start:
+            return json.loads(response_text[start:end])
+    except json.JSONDecodeError:
+        pass
+
+    return None
+
+
+def validate_router_result(result: dict) -> dict:
+    """
+    Validate and normalize router result. Fill in defaults for missing fields.
+    """
+    valid_modes = ["ANSWER", "TEACH", "QUIZ", "DEBUG", "ASK_CLARIFY", "SIMPLIFY"]
+    valid_topics = ["LangGraph", "Python", "LangChain", "JavaScript", "LLM",
+                    "Automation", "n8n", "GoHighLevel", "Unknown"]
+
+    mode = result.get("mode", "ASK_CLARIFY").upper()
+    if mode not in valid_modes:
+        mode = "ASK_CLARIFY"
+
+    topic = result.get("topic", "Unknown")
+    # Normalize topic capitalization
+    topic_lower = topic.lower()
+    topic_map = {t.lower(): t for t in valid_topics}
+    topic = topic_map.get(topic_lower, "Unknown")
+
+    confidence = result.get("confidence", 0.5)
+    if not isinstance(confidence, (int, float)):
+        confidence = 0.5
+    confidence = max(0.0, min(1.0, float(confidence)))
+
+    missing_info = result.get("missing_info", [])
+    if not isinstance(missing_info, list):
+        missing_info = []
+
+    reason = result.get("reason", "")
+
+    return {
+        "mode": mode,
+        "topic": topic,
+        "confidence": confidence,
+        "missing_info": missing_info,
+        "reason": reason
+    }
 
 
 def detect_verbosity(message: str) -> bool:
@@ -81,7 +157,7 @@ MAX_RESPONSE_LENGTH = 1200
 # Simple mode prompt - for beginner-friendly, ordered explanations
 SIMPLE_MODE_PROMPT = """
 [SIMPLE MODE - BEGINNER FRIENDLY EXPLANATION]
-The user has indicated they need a simpler explanation. Follow this EXACT format:
+The user has indicated they need a simpler explanation. Follow this EXACT format IN ORDER:
 
 1. **What it is (1 sentence):** Give a simple, jargon-free definition.
 
@@ -92,7 +168,10 @@ The user has indicated they need a simpler explanation. Follow this EXACT format
 
 3. **Everyday Analogy:** Compare it to something from daily life (cooking, driving, organizing, etc.)
 
-4. **Mini Example:** (Keep it very simple, no complex code)
+4. **Mini Example:** A tiny pseudo-code or flow diagram, NOT complex code. Example:
+   ```
+   User asks question → Router picks topic → Assistant answers → Done
+   ```
 
 5. **Check Question:** Ask ONE simple yes/no or A/B question to confirm understanding.
    Example: "Does that make sense?" or "Which sounds clearer: A or B?"
@@ -102,6 +181,7 @@ IMPORTANT RULES FOR SIMPLE MODE:
 - Use short sentences. One idea per sentence.
 - Speak like you're explaining to a smart 12-year-old.
 - Be encouraging, not condescending.
+- For LangGraph topics, always connect to real mechanisms: state, nodes, edges, reducers.
 
 """
 
@@ -136,13 +216,34 @@ SUBJECT_PROMPTS = {
 - Testing with pytest, unittest
 Always provide clear code examples and explanations.""",
 
-    Subject.LANGGRAPH: """You are an expert LangGraph assistant. You help with:
-- Building multi-agent systems with LangGraph
-- StateGraph, MessageGraph, and workflow design
-- Nodes, edges, and conditional routing
-- Tool integration and agent orchestration
-- Memory and persistence patterns
-Always reference the latest LangGraph patterns and best practices.""",
+    Subject.LANGGRAPH: """You are an expert LangGraph assistant. You MUST be specific and accurate about LangGraph mechanisms.
+
+CORE LANGGRAPH CONCEPTS YOU MUST KNOW:
+1. **State & Reducers**: State is a TypedDict. Without reducers, LangGraph uses "last-write-wins" - if two nodes write to the same key, one overwrites the other. Use `Annotated[list, add_messages]` to APPEND instead.
+
+2. **Nodes & Edges**: Nodes are functions that take state and return partial state updates. Edges connect nodes. Conditional edges use a function to pick the next node.
+
+3. **Checkpointing**: Enables persistence and "time travel". Use MemorySaver or SqliteSaver. Allows interrupt/resume of graph execution.
+
+4. **Interrupts**: Use `interrupt_before` or `interrupt_after` on nodes to pause execution for human-in-the-loop. Resume with `graph.invoke(None, config)`.
+
+5. **Tool Routing**: Bind tools to LLM with `llm.bind_tools()`. Check `tool_calls` on AIMessage to route to tool execution.
+
+RESPONSE RULES:
+- When style="normal": Provide technical depth with at least 1 concrete code example.
+- NEVER be generic. Always mention at least ONE specific LangGraph mechanism when relevant:
+  * Reducers / state merge / add_messages
+  * Conditional edges / should_continue pattern
+  * Loop termination conditions
+  * Checkpointing / MemorySaver / SqliteSaver
+  * interrupt_before / interrupt_after
+  * Tool calls and ToolNode routing
+
+Example of GOOD specificity:
+"Without a reducer like `add_messages`, parallel nodes writing to `messages` would cause last-write-wins - you'd lose one node's output."
+
+Example of BAD generic answer:
+"LangGraph helps you build multi-agent systems." (Too vague, no mechanism mentioned)""",
 
     Subject.LANGCHAIN: """You are an expert LangChain assistant. You help with:
 - Building LLM-powered applications
@@ -200,70 +301,147 @@ You have access to tools for saving notes, recalling past solutions, and searchi
 
 def router_node(state: StudyState) -> dict:
     """
-    Router node that classifies the user's message to determine the appropriate subject.
+    Router node that classifies the user's message using structured JSON routing.
 
-    Key logic:
-    - If SIMPLIFY intent detected AND we have a current_subject, keep that subject
-      and switch style to "simple" (do NOT route to GENERAL)
-    - Otherwise, classify normally and set style to "normal"
+    Returns JSON schema:
+    {
+        "mode": "ANSWER"|"TEACH"|"QUIZ"|"DEBUG"|"ASK_CLARIFY"|"SIMPLIFY",
+        "topic": "LangGraph"|"Python"|...|"Unknown",
+        "confidence": 0.0-1.0,
+        "missing_info": ["list of missing info"],
+        "reason": "short explanation"
+    }
+
+    Key routing rules:
+    1. If SIMPLIFY intent detected AND current_subject exists -> mode="SIMPLIFY", keep topic
+    2. If confidence < 0.65 -> mode="ASK_CLARIFY" with 1 targeted question
+    3. Only route to Unknown if user truly changes topic away from study subjects
     """
     user_message = state.get("user_message", "")
     current_subject = state.get("current_subject")
     last_question = state.get("last_subject_question")
+    last_answer = state.get("last_assistant_answer", "")
+    attempts_clarify = state.get("attempts_clarify", 0)
 
-    # Check for SIMPLIFY intent first
+    # Check for SIMPLIFY intent first (keyword-based, fast path)
     is_simplify = detect_simplify_intent(user_message)
 
-    # If user wants simplification AND we have a current subject context, keep it
+    # RULE 1: If user wants simplification AND we have a current subject context, keep it
     if is_simplify and current_subject is not None:
+        router_result = {
+            "mode": "SIMPLIFY",
+            "topic": current_subject.value.capitalize() if current_subject != Subject.GENERAL else "Unknown",
+            "confidence": 1.0,
+            "missing_info": [],
+            "reason": "User requested simpler explanation of current topic"
+        }
         return {
             "current_subject": current_subject,
             "style": "simple",
-            "user_level": "beginner"
+            "user_level": "beginner",
+            "router_result": router_result,
+            "attempts_clarify": 0  # Reset on valid interaction
         }
 
-    # Normal routing: classify the message to determine subject
+    # Use LLM for structured JSON routing
     llm = get_llm()
 
-    router_prompt = """You are a message classifier. Analyze the user's message and determine which subject it belongs to.
+    router_prompt = """You are a message router for a Study Buddy chatbot. Analyze the user's message and return a JSON decision.
 
-Available subjects:
-- python: Python programming language questions
-- langgraph: LangGraph multi-agent framework questions
-- langchain: LangChain LLM framework questions
-- javascript: JavaScript/TypeScript questions
-- llm: Large Language Model concepts and usage
-- automation: General automation and workflow questions
-- n8n: n8n workflow automation platform questions
-- gohighlevel: GoHighLevel CRM platform questions
-- general: If the message doesn't fit any specific subject
+AVAILABLE TOPICS:
+- LangGraph: Multi-agent framework, StateGraph, nodes, edges, reducers, checkpointing
+- Python: Python programming language
+- LangChain: LLM application framework
+- JavaScript: JavaScript/TypeScript
+- LLM: Large Language Model concepts
+- Automation: General automation/workflows
+- n8n: n8n workflow platform
+- GoHighLevel: GoHighLevel CRM
+- Unknown: Only if truly unrelated to any topic above
 
-Respond with ONLY the subject name in lowercase, nothing else.
+MODES:
+- ANSWER: Direct answer to a clear question
+- TEACH: Explain a concept in depth
+- QUIZ: User wants to test their knowledge
+- DEBUG: User has an error or bug to fix
+- ASK_CLARIFY: Question is ambiguous, need 1 targeted clarification
+- SIMPLIFY: User wants simpler explanation (detected by phrases like "I don't understand")
 
-User message: {message}"""
+RULES:
+1. If the message sounds like confusion/simplification request AND there was a previous topic, keep that topic and use mode=SIMPLIFY
+2. If confidence < 0.65, use mode=ASK_CLARIFY
+3. Only use topic=Unknown if the message is truly unrelated to all study topics
+
+Current context:
+- Previous topic: {current_topic}
+- Previous question: {last_question}
+
+User message: {message}
+
+Respond with ONLY valid JSON (no markdown, no explanation):
+{{"mode": "...", "topic": "...", "confidence": 0.0-1.0, "missing_info": [], "reason": "..."}}"""
+
+    context_topic = current_subject.value if current_subject else "None"
 
     response = llm.invoke([
-        SystemMessage(content=router_prompt.format(message=user_message))
+        SystemMessage(content=router_prompt.format(
+            message=user_message,
+            current_topic=context_topic,
+            last_question=last_question or "None"
+        ))
     ])
 
-    # Parse the response to get the subject
-    detected = response.content.strip().lower()
+    # Parse JSON response with fallback
+    parsed = parse_router_json(response.content)
 
-    try:
-        subject = Subject(detected)
-    except ValueError:
-        subject = Subject.GENERAL
+    if parsed is None:
+        # Fallback: JSON parsing failed, use ASK_CLARIFY safely
+        router_result = {
+            "mode": "ASK_CLARIFY",
+            "topic": context_topic if current_subject else "Unknown",
+            "confidence": 0.3,
+            "missing_info": ["Could not parse routing decision"],
+            "reason": "JSON parsing failed, requesting clarification"
+        }
+    else:
+        router_result = validate_router_result(parsed)
 
-    # Determine if this is a meaningful subject question (to store for later "explain that" follow-ups)
-    # A meaningful question is one that's routed to a specific subject (not GENERAL) and not a simplify request
-    new_last_question = last_question  # default: keep existing
-    if subject != Subject.GENERAL and not is_simplify:
+    # RULE 2: If confidence < 0.65 and not too many clarify attempts, ask for clarification
+    if router_result["confidence"] < 0.65 and attempts_clarify < 2:
+        router_result["mode"] = "ASK_CLARIFY"
+
+    # Map topic to Subject enum
+    topic_to_subject = {
+        "langgraph": Subject.LANGGRAPH,
+        "python": Subject.PYTHON,
+        "langchain": Subject.LANGCHAIN,
+        "javascript": Subject.JAVASCRIPT,
+        "llm": Subject.LLM,
+        "automation": Subject.AUTOMATION,
+        "n8n": Subject.N8N,
+        "gohighlevel": Subject.GOHIGHLEVEL,
+        "unknown": Subject.GENERAL
+    }
+    topic_lower = router_result["topic"].lower()
+    subject = topic_to_subject.get(topic_lower, Subject.GENERAL)
+
+    # Determine style based on mode
+    style = "simple" if router_result["mode"] == "SIMPLIFY" else "normal"
+
+    # Update last_subject_question if this is a meaningful subject question
+    new_last_question = last_question
+    if subject != Subject.GENERAL and router_result["mode"] not in ["SIMPLIFY", "ASK_CLARIFY"]:
         new_last_question = user_message
+
+    # Track clarify attempts
+    new_attempts = attempts_clarify + 1 if router_result["mode"] == "ASK_CLARIFY" else 0
 
     return {
         "current_subject": subject,
-        "style": "normal",
-        "last_subject_question": new_last_question
+        "style": style,
+        "router_result": router_result,
+        "last_subject_question": new_last_question,
+        "attempts_clarify": new_attempts
     }
 
 
@@ -339,8 +517,15 @@ Always be helpful and provide clear, actionable responses. The current subject i
     # Get response
     response = llm_with_tools.invoke(messages)
 
-    # Store verbose_mode flag for post-processing
-    return {"messages": [response], "verbose_mode": verbose_mode}
+    # Extract response content for storing as last_assistant_answer
+    response_text = response.content if hasattr(response, "content") else str(response)
+
+    # Store verbose_mode flag and last answer for post-processing and follow-ups
+    return {
+        "messages": [response],
+        "verbose_mode": verbose_mode,
+        "last_assistant_answer": response_text
+    }
 
 
 def tool_node(state: StudyState) -> dict:
@@ -353,9 +538,9 @@ def tool_node(state: StudyState) -> dict:
     return tool_executor.invoke(state)
 
 
-def should_continue(state: StudyState) -> Literal["tools", "end"]:
+def should_continue(state: StudyState) -> Literal["tools", "verifier", "end"]:
     """
-    Determine if we should continue to tool execution or end.
+    Determine if we should continue to tool execution, verifier, or end.
     """
     messages = state["messages"]
     last_message = messages[-1]
@@ -364,5 +549,156 @@ def should_continue(state: StudyState) -> Literal["tools", "end"]:
     if hasattr(last_message, "tool_calls") and last_message.tool_calls:
         return "tools"
 
+    # If verifier hasn't run yet, go to verifier
+    if not state.get("verifier_passed", False):
+        return "verifier"
+
     # Otherwise, end the conversation turn
+    return "end"
+
+
+def verifier_node(state: StudyState) -> dict:
+    """
+    Verifier node that checks the quality of the assistant's response.
+
+    Checks:
+    1. Did we answer the question directly?
+    2. Are there vague claims without specific mechanisms?
+    3. If asking for specifics and we don't know, do we admit uncertainty?
+
+    If verification fails, sets verifier_passed=False and provides feedback.
+    If verification passes, sets verifier_passed=True.
+    """
+    messages = state.get("messages", [])
+    user_message = state.get("user_message", "")
+    subject = state.get("current_subject", Subject.GENERAL)
+    style = state.get("style", "normal")
+
+    if not messages:
+        return {"verifier_passed": True}
+
+    last_message = messages[-1]
+    response_text = last_message.content if hasattr(last_message, "content") else str(last_message)
+
+    # Skip verification for tool calls (they'll loop back)
+    if hasattr(last_message, "tool_calls") and last_message.tool_calls:
+        return {"verifier_passed": True}
+
+    # Skip verification for simple mode (already structured)
+    if style == "simple":
+        return {"verifier_passed": True}
+
+    # Skip for very short responses (likely clarification questions)
+    if len(response_text) < 100:
+        return {"verifier_passed": True}
+
+    # Only verify LangGraph responses for specificity
+    if subject != Subject.LANGGRAPH:
+        return {"verifier_passed": True}
+
+    # Use LLM to verify response quality
+    llm = get_llm()
+
+    verifier_prompt = """You are a response quality verifier for a LangGraph tutoring chatbot.
+
+USER QUESTION: {user_question}
+
+ASSISTANT RESPONSE:
+{response}
+
+VERIFY these criteria:
+1. DIRECTNESS: Does the response directly answer the user's question?
+2. SPECIFICITY: Does it mention at least ONE specific LangGraph mechanism (reducers, add_messages, checkpointing, interrupts, conditional edges, ToolNode, etc.)?
+3. HONESTY: If the response makes claims, are they concrete or vague?
+
+PASS if:
+- Response is direct and mentions specific mechanisms
+- OR response honestly says "I'm not sure" when uncertain
+
+FAIL if:
+- Response is vague/generic with no specific LangGraph mechanisms mentioned
+- Response doesn't answer the actual question
+- Response makes hand-wavy claims without concrete details
+
+Respond with ONLY valid JSON:
+{{"pass": true/false, "reason": "short explanation", "suggestion": "improvement if failed"}}"""
+
+    try:
+        result = llm.invoke([
+            SystemMessage(content=verifier_prompt.format(
+                user_question=user_message,
+                response=response_text[:1500]  # Truncate for cost
+            ))
+        ])
+
+        parsed = parse_router_json(result.content)
+        if parsed and not parsed.get("pass", True):
+            return {
+                "verifier_passed": False,
+                "verifier_feedback": parsed.get("suggestion", "Be more specific about LangGraph mechanisms.")
+            }
+    except Exception:
+        # If verification fails, let it pass to avoid blocking
+        pass
+
+    return {"verifier_passed": True}
+
+
+def revise_node(state: StudyState) -> dict:
+    """
+    Revise node that improves the response based on verifier feedback.
+    Only called when verifier_passed=False.
+    """
+    messages = state.get("messages", [])
+    feedback = state.get("verifier_feedback", "Be more specific.")
+    user_message = state.get("user_message", "")
+    subject = state.get("current_subject", Subject.GENERAL)
+
+    if not messages:
+        return {"verifier_passed": True}
+
+    last_message = messages[-1]
+    original_response = last_message.content if hasattr(last_message, "content") else str(last_message)
+
+    llm = get_llm()
+
+    revise_prompt = """You are revising a LangGraph tutoring response to be more specific and accurate.
+
+ORIGINAL USER QUESTION: {user_question}
+
+ORIGINAL RESPONSE (needs improvement):
+{original}
+
+FEEDBACK: {feedback}
+
+REVISION RULES:
+1. Keep the same structure and length
+2. Add at least ONE specific LangGraph mechanism (reducers, add_messages, checkpointing, interrupts, conditional edges, etc.)
+3. Replace vague claims with concrete explanations
+4. If you don't know something, say "I'm not sure about X, but..."
+
+Write the REVISED response only (no meta-commentary):"""
+
+    result = llm.invoke([
+        SystemMessage(content=revise_prompt.format(
+            user_question=user_message,
+            original=original_response,
+            feedback=feedback
+        ))
+    ])
+
+    # Replace the last message with revised version
+    revised_message = AIMessage(content=result.content)
+
+    return {
+        "messages": [revised_message],
+        "verifier_passed": True,  # Mark as passed after revision
+        "last_assistant_answer": result.content
+    }
+
+
+def should_revise(state: StudyState) -> Literal["revise", "end"]:
+    """Determine if we need to revise the response."""
+    if not state.get("verifier_passed", True):
+        return "revise"
     return "end"

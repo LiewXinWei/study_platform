@@ -5,6 +5,7 @@ from langchain_core.messages import HumanMessage
 from state import StudyState
 from agents import (
     router_node, assistant_node, should_continue,
+    verifier_node, revise_node, should_revise,
     rewrite_to_concise, get_llm, MAX_RESPONSE_LENGTH
 )
 from tools import all_tools
@@ -20,10 +21,15 @@ def create_study_graph():
 
     Flow:
     1. User message comes in
-    2. Router classifies the subject
+    2. Router classifies subject (JSON routing with confidence)
     3. Assistant responds (may call tools)
     4. If tools called, execute them and loop back to assistant
-    5. Return final response
+    5. Verifier checks response quality (for LangGraph topics)
+    6. If verifier fails, revise node improves the response
+    7. Return final response
+
+    Graph structure:
+    router -> assistant -> [tools loop] -> verifier -> [revise if needed] -> END
     """
 
     # Create the graph
@@ -33,6 +39,8 @@ def create_study_graph():
     workflow.add_node("router", router_node)
     workflow.add_node("assistant", assistant_node)
     workflow.add_node("tools", ToolNode(all_tools))
+    workflow.add_node("verifier", verifier_node)
+    workflow.add_node("revise", revise_node)
 
     # Set entry point
     workflow.set_entry_point("router")
@@ -41,18 +49,32 @@ def create_study_graph():
     # Router always goes to assistant
     workflow.add_edge("router", "assistant")
 
-    # Assistant conditionally goes to tools or ends
+    # Assistant conditionally goes to tools, verifier, or ends
     workflow.add_conditional_edges(
         "assistant",
         should_continue,
         {
             "tools": "tools",
+            "verifier": "verifier",
             "end": END
         }
     )
 
     # Tools always go back to assistant
     workflow.add_edge("tools", "assistant")
+
+    # Verifier conditionally goes to revise or ends
+    workflow.add_conditional_edges(
+        "verifier",
+        should_revise,
+        {
+            "revise": "revise",
+            "end": END
+        }
+    )
+
+    # Revise always ends (only one revision attempt)
+    workflow.add_edge("revise", END)
 
     # Compile the graph
     graph = workflow.compile()
@@ -82,8 +104,10 @@ def chat(message: str, session_id: str = "default") -> dict:
         "messages": [],
         "current_subject": None,
         "last_subject_question": None,
+        "last_assistant_answer": None,
         "user_level": "beginner",
-        "style": "normal"
+        "style": "normal",
+        "attempts_clarify": 0
     })
 
     # Build state for this turn, preserving cross-turn context
@@ -96,7 +120,12 @@ def chat(message: str, session_id: str = "default") -> dict:
         "verbose_mode": False,
         "user_level": session_state.get("user_level", "beginner"),
         "style": "normal",  # Reset style each turn (router will set to "simple" if needed)
-        "last_subject_question": session_state.get("last_subject_question")
+        "last_subject_question": session_state.get("last_subject_question"),
+        "last_assistant_answer": session_state.get("last_assistant_answer"),
+        "attempts_clarify": session_state.get("attempts_clarify", 0),
+        "router_result": None,
+        "verifier_passed": False,  # Will be set by verifier node
+        "verifier_feedback": None
     }
 
     # Run the graph
@@ -118,14 +147,17 @@ def chat(message: str, session_id: str = "default") -> dict:
         "messages": result["messages"],
         "current_subject": result.get("current_subject"),
         "last_subject_question": result.get("last_subject_question"),
+        "last_assistant_answer": result.get("last_assistant_answer"),
         "user_level": result.get("user_level", "beginner"),
-        "style": result.get("style", "normal")
+        "style": result.get("style", "normal"),
+        "attempts_clarify": result.get("attempts_clarify", 0)
     }
 
     return {
         "response": response_content,
         "detected_subject": result.get("current_subject"),
         "style": result.get("style", "normal"),
+        "router_result": result.get("router_result"),
         "session_id": session_id
     }
 
