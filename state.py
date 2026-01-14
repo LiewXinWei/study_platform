@@ -25,3 +25,12 @@ class StudyState(TypedDict):
 
     # Flag to indicate verbose mode (user requested detail)
     verbose_mode: bool
+
+    # User's experience level: "beginner" (default) or "advanced"
+    user_level: str
+
+    # Response style: "normal" or "simple" (triggered by SIMPLIFY intent)
+    style: str
+
+    # Store the last meaningful subject question for "explain that" follow-ups
+    last_subject_question: Optional[str]

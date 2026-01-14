@@ -26,11 +26,31 @@ VERBOSE_KEYWORDS = [
     "comprehensive", "thorough", "full explanation", "more info", "more information"
 ]
 
+# SIMPLIFY intent keywords - user wants simpler explanation, NOT a topic change
+SIMPLIFY_KEYWORDS = [
+    "im not a tech person", "i'm not a tech person", "not a tech person",
+    "i dont understand", "i don't understand", "don't understand", "dont understand",
+    "confusing", "confused", "explain simpler", "explain it simpler",
+    "explain like im 5", "explain like i'm 5", "explain like im 12", "explain like i'm 12",
+    "eli5", "in order", "in order way", "tell me in order",
+    "break it down", "break down", "use simple words", "simpler words",
+    "too technical", "too complicated", "too complex", "what does that mean",
+    "what do you mean", "explain that", "can you simplify", "simplify",
+    "dumb it down", "layman terms", "layman's terms", "plain english",
+    "beginner friendly", "for beginners", "simple explanation"
+]
+
 
 def detect_verbosity(message: str) -> bool:
     """Check if user is requesting detailed/verbose response."""
     message_lower = message.lower()
     return any(keyword in message_lower for keyword in VERBOSE_KEYWORDS)
+
+
+def detect_simplify_intent(message: str) -> bool:
+    """Check if user is asking for a simpler explanation (NOT a topic change)."""
+    message_lower = message.lower()
+    return any(keyword in message_lower for keyword in SIMPLIFY_KEYWORDS)
 
 
 def detect_code_request(message: str) -> bool:
@@ -57,6 +77,33 @@ RESPONSE STYLE RULES (ALWAYS FOLLOW):
 
 # Character limit for auto-rewrite
 MAX_RESPONSE_LENGTH = 1200
+
+# Simple mode prompt - for beginner-friendly, ordered explanations
+SIMPLE_MODE_PROMPT = """
+[SIMPLE MODE - BEGINNER FRIENDLY EXPLANATION]
+The user has indicated they need a simpler explanation. Follow this EXACT format:
+
+1. **What it is (1 sentence):** Give a simple, jargon-free definition.
+
+2. **3 Key Ideas:**
+   - First key point in plain language
+   - Second key point in plain language
+   - Third key point in plain language
+
+3. **Everyday Analogy:** Compare it to something from daily life (cooking, driving, organizing, etc.)
+
+4. **Mini Example:** (Keep it very simple, no complex code)
+
+5. **Check Question:** Ask ONE simple yes/no or A/B question to confirm understanding.
+   Example: "Does that make sense?" or "Which sounds clearer: A or B?"
+
+IMPORTANT RULES FOR SIMPLE MODE:
+- NO jargon. If you must use a technical term, define it immediately in parentheses.
+- Use short sentences. One idea per sentence.
+- Speak like you're explaining to a smart 12-year-old.
+- Be encouraging, not condescending.
+
+"""
 
 
 def rewrite_to_concise(response: str, llm) -> str:
@@ -154,7 +201,28 @@ You have access to tools for saving notes, recalling past solutions, and searchi
 def router_node(state: StudyState) -> dict:
     """
     Router node that classifies the user's message to determine the appropriate subject.
+
+    Key logic:
+    - If SIMPLIFY intent detected AND we have a current_subject, keep that subject
+      and switch style to "simple" (do NOT route to GENERAL)
+    - Otherwise, classify normally and set style to "normal"
     """
+    user_message = state.get("user_message", "")
+    current_subject = state.get("current_subject")
+    last_question = state.get("last_subject_question")
+
+    # Check for SIMPLIFY intent first
+    is_simplify = detect_simplify_intent(user_message)
+
+    # If user wants simplification AND we have a current subject context, keep it
+    if is_simplify and current_subject is not None:
+        return {
+            "current_subject": current_subject,
+            "style": "simple",
+            "user_level": "beginner"
+        }
+
+    # Normal routing: classify the message to determine subject
     llm = get_llm()
 
     router_prompt = """You are a message classifier. Analyze the user's message and determine which subject it belongs to.
@@ -175,7 +243,7 @@ Respond with ONLY the subject name in lowercase, nothing else.
 User message: {message}"""
 
     response = llm.invoke([
-        SystemMessage(content=router_prompt.format(message=state["user_message"]))
+        SystemMessage(content=router_prompt.format(message=user_message))
     ])
 
     # Parse the response to get the subject
@@ -186,7 +254,17 @@ User message: {message}"""
     except ValueError:
         subject = Subject.GENERAL
 
-    return {"current_subject": subject}
+    # Determine if this is a meaningful subject question (to store for later "explain that" follow-ups)
+    # A meaningful question is one that's routed to a specific subject (not GENERAL) and not a simplify request
+    new_last_question = last_question  # default: keep existing
+    if subject != Subject.GENERAL and not is_simplify:
+        new_last_question = user_message
+
+    return {
+        "current_subject": subject,
+        "style": "normal",
+        "last_subject_question": new_last_question
+    }
 
 
 def assistant_node(state: StudyState) -> dict:
@@ -194,24 +272,39 @@ def assistant_node(state: StudyState) -> dict:
     Main assistant node that responds based on the detected subject.
     Uses tools for notes, solutions, and web search.
     Applies concise response rules by default.
+
+    When style="simple", uses beginner-friendly ordered explanation format.
     """
     llm = get_llm()
     subject = state.get("current_subject", Subject.GENERAL)
     user_message = state.get("user_message", "")
+    style = state.get("style", "normal")
+    last_question = state.get("last_subject_question", "")
 
     # Detect if user wants verbose/detailed response
     verbose_mode = detect_verbosity(user_message)
     code_requested = detect_code_request(user_message)
 
-    # Build system prompt with concise rules first
-    system_prompt = CONCISE_RULES
+    # Check if simple mode is active
+    simple_mode = (style == "simple")
 
-    # Add verbose mode override if detected
-    if verbose_mode:
+    # Build system prompt
+    if simple_mode:
+        # Use simple mode prompt for beginner-friendly explanations
+        system_prompt = SIMPLE_MODE_PROMPT
+        # If user said "explain that" or similar and we have a last question, reference it
+        if last_question and detect_simplify_intent(user_message):
+            system_prompt += f"\nThe user is asking for a simpler explanation of their previous question: \"{last_question}\"\n"
+    else:
+        # Normal mode: use concise rules
+        system_prompt = CONCISE_RULES
+
+    # Add verbose mode override if detected (not in simple mode, as simple mode has its own format)
+    if verbose_mode and not simple_mode:
         system_prompt += "\n[VERBOSE MODE]: User requested detailed explanation. You may provide longer, more comprehensive responses.\n"
 
     # Add code permission if detected
-    if code_requested:
+    if code_requested and not simple_mode:
         system_prompt += "\n[CODE REQUESTED]: User explicitly asked for code. You may include code examples.\n"
 
     # Add subject-specific prompt

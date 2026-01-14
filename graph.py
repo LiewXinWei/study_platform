@@ -9,6 +9,10 @@ from agents import (
 )
 from tools import all_tools
 
+# Session store to maintain state across conversation turns
+# This preserves current_subject, last_subject_question, etc. between messages
+_session_store: dict = {}
+
 
 def create_study_graph():
     """
@@ -69,16 +73,30 @@ def chat(message: str, session_id: str = "default") -> dict:
         session_id: Session identifier for conversation tracking
 
     Returns:
-        Dictionary with response and detected subject
+        Dictionary with response, detected subject, style, and session_id
     """
-    # Initialize state
-    initial_state = {
-        "messages": [HumanMessage(content=message)],
+    global _session_store
+
+    # Get existing session state or initialize new one
+    session_state = _session_store.get(session_id, {
+        "messages": [],
         "current_subject": None,
+        "last_subject_question": None,
+        "user_level": "beginner",
+        "style": "normal"
+    })
+
+    # Build state for this turn, preserving cross-turn context
+    initial_state = {
+        "messages": session_state["messages"] + [HumanMessage(content=message)],
+        "current_subject": session_state["current_subject"],  # Preserve from previous turn
         "session_id": session_id,
         "user_message": message,
         "needs_web_search": False,
-        "verbose_mode": False
+        "verbose_mode": False,
+        "user_level": session_state.get("user_level", "beginner"),
+        "style": "normal",  # Reset style each turn (router will set to "simple" if needed)
+        "last_subject_question": session_state.get("last_subject_question")
     }
 
     # Run the graph
@@ -88,17 +106,35 @@ def chat(message: str, session_id: str = "default") -> dict:
     final_message = result["messages"][-1]
     response_content = final_message.content if hasattr(final_message, "content") else str(final_message)
 
-    # Post-processing: auto-rewrite long responses if not in verbose mode
+    # Post-processing: auto-rewrite long responses if not in verbose mode (skip for simple mode)
     verbose_mode = result.get("verbose_mode", False)
-    if not verbose_mode and len(response_content) > MAX_RESPONSE_LENGTH:
+    style = result.get("style", "normal")
+    if not verbose_mode and style != "simple" and len(response_content) > MAX_RESPONSE_LENGTH:
         llm = get_llm()
         response_content = rewrite_to_concise(response_content, llm)
+
+    # Update session store with new state for next turn
+    _session_store[session_id] = {
+        "messages": result["messages"],
+        "current_subject": result.get("current_subject"),
+        "last_subject_question": result.get("last_subject_question"),
+        "user_level": result.get("user_level", "beginner"),
+        "style": result.get("style", "normal")
+    }
 
     return {
         "response": response_content,
         "detected_subject": result.get("current_subject"),
+        "style": result.get("style", "normal"),
         "session_id": session_id
     }
+
+
+def clear_session(session_id: str = "default") -> None:
+    """Clear session state for a given session ID."""
+    global _session_store
+    if session_id in _session_store:
+        del _session_store[session_id]
 
 
 # For visualization (optional)
